@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""本地启动入口：uv run uvicorn main:app。"""
 
-app = FastAPI()
+from gateway.bootstrap import build_local_gateway
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = build_local_gateway()
