@@ -23,6 +23,7 @@ class FailureCode(str, Enum):
     RETRIES_EXHAUSTED = "RETRIES_EXHAUSTED"
     CIRCUIT_OPEN = "CIRCUIT_OPEN"
     RETRY_NOT_SAFE = "RETRY_NOT_SAFE"
+    HEARTBEAT_DRAINING = "HEARTBEAT_DRAINING"
 
 
 class GatewayError(Exception):
@@ -95,3 +96,9 @@ class CircuitOpen(GatewayError):
 
 class RetriesExhausted(GatewayError):
     code = FailureCode.RETRIES_EXHAUSTED
+
+
+class HeartbeatWhileDraining(GatewayError):
+    """实例处于平滑下线中：续约被明确拒绝，不允许"宣布下线又被续约复活"。"""
+
+    code = FailureCode.HEARTBEAT_DRAINING

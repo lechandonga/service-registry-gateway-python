@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 
 from .clock import Clock, SystemClock
 from .errors import HeartbeatUnknown, InstanceNotFound, RegistrationConflict
@@ -16,6 +17,17 @@ class Registry:
         self._clock = clock or SystemClock()
         self._instances: dict[InstanceId, Instance] = {}
         self._lock = asyncio.Lock()
+        # 租约保护钩子（由平滑下线层注入）：返回 True 表示该实例虽在册但
+        # 正在退出，expire_due 跳过摘除、heartbeat 拒绝续约，避免
+        # "在途请求被提前摘除"或"宣布下线又被续约复活"。
+        self._retirement_guard: Callable[[InstanceId], bool] | None = None
+
+    def set_retirement_guard(self, guard: Callable[[InstanceId], bool] | None) -> None:
+        self._retirement_guard = guard
+
+    def _is_retiring(self, instance_id: InstanceId) -> bool:
+        guard = self._retirement_guard
+        return bool(guard is not None and guard(instance_id))
 
     async def register(self, instance: Instance) -> bool:
         """注册新实例；重复注册抛 RegistrationConflict，不静默覆盖。"""
@@ -43,12 +55,22 @@ class Registry:
             return instance
 
     async def heartbeat(self, instance_id: InstanceId, lease_seconds: float | None = None) -> float:
-        """续约；实例未知抛 HeartbeatUnknown；租约已过期视为失效（已摘除），抛 HeartbeatUnknown。"""
+        """续约；实例未知抛 HeartbeatUnknown；租约已过期视为失效（已摘除），抛 HeartbeatUnknown。
+
+        处于平滑下线中的实例续约被明确拒绝（HeartbeatWhileDraining）：
+        下线中的实例受租约保护不会被摘除，但也绝不允许被续约"复活"。
+        """
         async with self._lock:
             instance = self._instances.get(instance_id)
             now = self._clock.now()
             if instance is None:
                 raise HeartbeatUnknown(f"续约失败，实例不存在: {instance_id}")
+            if self._is_retiring(instance_id):
+                from .errors import HeartbeatWhileDraining
+
+                raise HeartbeatWhileDraining(
+                    f"续约被拒绝，实例正在平滑下线: {instance_id}",
+                )
             if instance.lease_expired(now):
                 # 过期实例不得复活，摘除后告知调用方需重新注册。
                 self._instances.pop(instance_id, None)
@@ -59,11 +81,17 @@ class Registry:
             return instance.expires_at
 
     async def expire_due(self) -> list[InstanceId]:
-        """摘除所有租约过期实例，返回被摘除的实例 id。"""
+        """摘除所有租约过期实例，返回被摘除的实例 id。
+
+        平滑下线中的实例跳过摘除：它必须在在途请求归零后由下线流程主动注销，
+        保证在途请求能正常跑完。
+        """
         async with self._lock:
             now = self._clock.now()
             expired = [
-                iid for iid, inst in self._instances.items() if inst.lease_expired(now)
+                iid
+                for iid, inst in self._instances.items()
+                if inst.lease_expired(now) and not self._is_retiring(iid)
             ]
             for iid in expired:
                 del self._instances[iid]

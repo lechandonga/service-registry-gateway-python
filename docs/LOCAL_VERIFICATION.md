@@ -17,7 +17,7 @@ uv sync
 uv run pytest -v
 ```
 
-测试覆盖（共 50+ 用例）：
+测试覆盖（共 65+ 用例）：
 
 | 文件 | 覆盖链路 |
 | --- | --- |
@@ -30,6 +30,10 @@ uv run pytest -v
 | `tests/test_gateway.py` | 非幂等不重试、只读请求重试换实例、熔断实例零调用、超时、背压、资源清理 |
 | `tests/test_api.py` | HTTP 全链路：注册协议、代理、头匹配、模式注入、状态观测 |
 | `tests/test_concurrency.py` | **并发注册摘除绝不选到已摘除实例**、混合流量计数一致、续约与过期竞争 |
+| `tests/test_session.py` | 粘性稳定落点、滑动有效期、不合法标识回退加权、**绑定实例退出后自动切换并给出切换原因**、陈旧绑定清理 |
+| `tests/test_drain.py` | 下线发起结果可区分、**新请求不选中但在途请求跑完才退出**、下线中续约拒绝、租约保护、收尾只执行一次 |
+| `tests/test_sticky_concurrency.py` | **下线/摘除/选路并发不选到已退出实例**、连接计数与会话绑定无残留、并发下线收尾唯一、重试不反复落同一失败实例 |
+| `tests/test_api_sticky_drain.py` | HTTP 全链路：粘性代理与会话观测、下线端点结果可区分、下线中续约 409 |
 
 测试日志会打印上游状态与判定依据，例如：
 
@@ -93,6 +97,38 @@ sleep 3
 curl -s localhost:8077/proxy/demo/x   # 200
 ```
 
+### 会话粘性与平滑下线
+
+```bash
+# 4.7 会话粘性：同一会话稳定落点，绑定可观测
+curl -s -H 'x-session-id: sess-42' localhost:8077/proxy/users/1
+curl -s localhost:8077/admin/sessions/sess-42
+# {"bound": true, "instance": "users://127.0.0.1:900x", "bound_at": ...,
+#  "expires_at": ..., "remaining_seconds": ...}
+# 不合法会话标识不报错，按普通加权转发
+curl -i -H 'x-session-id: bad key!' localhost:8077/proxy/users/1   # 200
+
+# 4.8 平滑下线（无在途时立即完成）
+curl -s -X POST localhost:8077/admin/instances/users/127.0.0.1/9001/drain
+# {"code": "DRAIN_COMPLETED", ...}
+curl -s -X POST localhost:8077/admin/instances/users/127.0.0.1/9001/drain
+# 409 {"code": "ALREADY_DRAINED"} —— 重复发起可区分
+curl -s localhost:8077/admin/instances/users/127.0.0.1/9001/drain
+# {"state": "DRAINED", ...}
+# 下线完成后新请求不再选中它，但 users 服务仍有 9002 可服务
+for i in 1 2 3; do curl -s localhost:8077/proxy/users/1; done
+
+# 4.9 对不存在实例发起下线 -> 404 NOT_FOUND
+curl -i -X POST localhost:8077/admin/instances/users/10.9.9.9/1/drain
+
+# 4.10 下线中续约 -> 409 HEARTBEAT_DRAINING（需先制造在途；自动化用例已覆盖）
+uv run pytest -k draining -v
+```
+
+> "在途请求跑完再退场"的完整场景由自动化用例覆盖：
+> `tests/test_drain.py::test_inflight_request_completes_after_drain`
+> （在途请求进入下游后发起下线，验证新请求被拒、在途请求正常返回、随后实例才退出）。
+
 ### 其他失败形态
 
 ```bash
@@ -109,8 +145,12 @@ curl -s -X POST localhost:8077/admin/instances/demo/h1/1/mode \
 
 ## 5. 可解释性入口
 
-- `GET /admin/status/{service}`：实例的健康/熔断/连接数与文字判定依据；
-- 服务端 JSON 日志：每次 dispatch 输出 `record`（每次尝试的上游、状态、错误 code）
-  与 `candidates`（每个候选被保留或剔除的原因）；
+- `GET /admin/status/{service}`：实例的健康/熔断/下线状态/连接数与文字判定依据；
+- `GET /admin/sessions/{key}` 与 `GET /admin/sessions`：会话绑定实例、建立时间、
+  剩余有效期；
+- `GET /admin/instances/{svc}/{host}/{port}/drain`：下线状态（含在途数与发起/完成时间）；
+- 服务端 JSON 日志：每次 dispatch 输出 `record`（每次尝试的上游、状态、错误 code、
+  粘性命中/切换及 `switch_reason`）与 `candidates`（每个候选被保留或剔除的原因）；
+  会话绑定建立、平滑下线发起与完成、实例退出/切换的判定依据均有独立日志行；
 - 错误响应只包含 `code` 与 `message`，内部异常仅以 `INTERNAL_ERROR + request_id`
   返回，堆栈只写服务端日志。

@@ -58,6 +58,8 @@ def create_app(
     logger: logging.Logger | None = None,
     on_startup=None,
     on_shutdown=None,
+    sessions=None,
+    drain=None,
 ) -> FastAPI:
     """用注入的组件创建 FastAPI 应用，便于测试替换。"""
     import contextlib
@@ -112,6 +114,10 @@ def create_app(
         inst = await registry.deregister(iid)
         health.remove(iid)
         circuit.remove(iid)
+        if drain is not None:
+            drain.remove(iid)
+        if sessions is not None:
+            sessions.unbind_instance(iid)
         return {"deregistered": True, "instance": _instance_dict(inst)}
 
     @app.post("/admin/instances/{service}/{host}/{port}/heartbeat")
@@ -130,6 +136,40 @@ def create_app(
                 items.append(_instance_dict(inst))
             result[service] = items
         return {"services": result}
+
+    @app.post("/admin/instances/{service}/{host}/{port}/drain")
+    async def drain_instance(service: str, host: str, port: int) -> JSONResponse:
+        """发起平滑下线：新请求不再落到该实例，在途请求跑完后真正退出。"""
+        if drain is None:
+            return JSONResponse(status_code=501, content={"code": "DRAIN_DISABLED", "message": "未启用平滑下线"})
+        iid = InstanceId(service=service, host=host, port=port)
+        result = await drain.start_drain(iid)
+        logger.info(
+            "平滑下线判定 instance=%s code=%s in_flight=%s",
+            iid, result.code.value, result.in_flight,
+        )
+        status = 200 if result.accepted else (404 if result.code.value == "NOT_FOUND" else 409)
+        return JSONResponse(status_code=status, content=result.to_dict())
+
+    @app.get("/admin/instances/{service}/{host}/{port}/drain")
+    async def drain_status(service: str, host: str, port: int) -> dict[str, Any]:
+        if drain is None:
+            return {"state": "SERVING", "drain_enabled": False}
+        iid = InstanceId(service=service, host=host, port=port)
+        return {"instance": str(iid), **drain.explain(iid)}
+
+    @app.get("/admin/sessions")
+    async def list_sessions() -> dict[str, Any]:
+        if sessions is None:
+            return {"sessions": []}
+        return {"sessions": sessions.snapshot()}
+
+    @app.get("/admin/sessions/{session_key}")
+    async def session_binding(session_key: str) -> dict[str, Any]:
+        """会话绑定观测：固定在哪个实例、何时建立、还剩多久。"""
+        if sessions is None:
+            return {"session_key": session_key, "bound": False}
+        return sessions.explain(session_key)
 
     @app.post("/admin/rules")
     async def add_rule(body: RuleIn) -> dict[str, Any]:
@@ -175,6 +215,7 @@ def create_app(
                     "lease_expires_at": inst.expires_at,
                     "health": health.explain(inst.id),
                     "circuit": circuit.explain(inst.id),
+                    "drain": drain.explain(inst.id) if drain is not None else {"state": "SERVING"},
                     "active_connections": gateway_pool_active(gateway, inst.id),
                 }
             )
@@ -273,5 +314,6 @@ def _http_status(exc: GatewayError) -> int:
         "RETRIES_EXHAUSTED": 502,
         "CIRCUIT_OPEN": 503,
         "RETRY_NOT_SAFE": 422,
+        "HEARTBEAT_DRAINING": 409,
     }
     return mapping.get(exc.code.value, 500)

@@ -11,11 +11,13 @@ from fastapi import FastAPI
 from .api import create_app
 from .circuit import CircuitBreaker
 from .clock import SystemClock
+from .drain import DrainManager
 from .health import HealthMonitor, HealthProber
 from .models import Instance, RouteRule, new_instance
 from .pool import ConnectionPool
 from .registry import Registry
 from .router import Router
+from .session import SessionStore
 from .transport import UpstreamTransport
 from .upstream import UpstreamCluster, MockUpstream
 from .engine import Gateway
@@ -50,11 +52,29 @@ def build_components(clock=None):
     pool = ConnectionPool(max_per_upstream=8, max_total=64)
     cluster = UpstreamCluster()
     transport = UpstreamTransport(cluster)
-    router = Router(registry, health, circuit)
+    sessions = SessionStore(clock, ttl_seconds=300.0)
+    drain = DrainManager(registry, pool, clock)
+    router = Router(registry, health, circuit, session_store=sessions, drain=drain)
     gateway = Gateway(
         router, transport, health, circuit, pool,
-        max_retries=2, upstream_timeout=3.0, logger=logger,
+        max_retries=2, upstream_timeout=3.0, drain=drain, logger=logger,
     )
+
+    async def finalize_drain(iid) -> None:
+        """平滑下线收尾：在途归零后注销实例并联动清理各组件状态。"""
+        with contextlib.suppress(Exception):
+            await registry.deregister(iid)
+        health.remove(iid)
+        circuit.remove(iid)
+        pool.remove(iid)
+        removed = sessions.unbind_instance(iid)
+        logger.info(
+            "平滑下线完成 instance=%s 清理会话绑定=%d", iid, removed,
+        )
+
+    drain.set_finalizer(finalize_drain)
+    # 注册表租约保护：下线中的实例不被过期摘除、心跳被明确拒绝。
+    registry.set_retirement_guard(drain.is_draining)
     return {
         "clock": clock,
         "logger": logger,
@@ -66,6 +86,8 @@ def build_components(clock=None):
         "transport": transport,
         "router": router,
         "gateway": gateway,
+        "sessions": sessions,
+        "drain": drain,
         "prober": _ClusterProber(cluster),
     }
 
@@ -116,7 +138,9 @@ def build_local_gateway() -> FastAPI:
                     components["health"].remove(iid)
                     components["circuit"].remove(iid)
                     components["pool"].remove(iid)
-                    logger.info("租约过期摘除 instance=%s", iid)
+                    components["drain"].remove(iid)
+                    cleared = components["sessions"].unbind_instance(iid)
+                    logger.info("租约过期摘除 instance=%s 清理会话绑定=%d", iid, cleared)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=1.0)
 
@@ -153,6 +177,8 @@ def build_local_gateway() -> FastAPI:
         components["cluster"],
         clock=components["clock"],
         logger=components["logger"],
+        sessions=components["sessions"],
+        drain=components["drain"],
     )
     app.router.lifespan_context = lifespan
     return app
