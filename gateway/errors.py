@@ -23,6 +23,11 @@ class FailureCode(str, Enum):
     RETRIES_EXHAUSTED = "RETRIES_EXHAUSTED"
     CIRCUIT_OPEN = "CIRCUIT_OPEN"
     RETRY_NOT_SAFE = "RETRY_NOT_SAFE"
+    # 平滑下线相关（对调用方可区分）
+    INSTANCE_DRAIN_NOT_FOUND = "INSTANCE_DRAIN_NOT_FOUND"
+    INSTANCE_ALREADY_DRAINING = "INSTANCE_ALREADY_DRAINING"
+    INSTANCE_DRAINING = "INSTANCE_DRAINING"
+    INSTANCE_EXITING = "INSTANCE_EXITING"
 
 
 class GatewayError(Exception):
@@ -91,6 +96,30 @@ class ConcurrencyLimitReached(GatewayError):
 
 class CircuitOpen(GatewayError):
     code = FailureCode.CIRCUIT_OPEN
+
+
+class DrainInstanceNotFound(GatewayError):
+    """对不存在 / 已退出 / 已过期的实例发起平滑下线。"""
+
+    code = FailureCode.INSTANCE_DRAIN_NOT_FOUND
+
+
+class InstanceAlreadyDraining(GatewayError):
+    """对已处于下线过程中的实例重复发起下线。"""
+
+    code = FailureCode.INSTANCE_ALREADY_DRAINING
+
+
+class HeartbeatDrainingRejected(GatewayError):
+    """下线过程中的续约被明确拒绝（下线不会被续约复活）。"""
+
+    code = FailureCode.INSTANCE_DRAINING
+
+
+class InstanceExiting(GatewayError):
+    """并发窗口内选中/获得到已宣告退出的实例，换实例重试即可，不面向终端失败。"""
+
+    code = FailureCode.INSTANCE_EXITING
 
 
 class RetriesExhausted(GatewayError):

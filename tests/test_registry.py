@@ -106,3 +106,25 @@ async def test_concurrent_register_and_deregister_no_corruption():
     # 初始实例仍在，churn 的实例全部注销干净，无残留半状态。
     assert await reg.get(inst.id) is not None
     assert len(await reg.instances("svc")) == 1
+
+
+@pytest.mark.asyncio
+async def test_draining_instance_exempt_from_expiry_and_heartbeat_rejected():
+    from gateway.errors import HeartbeatDrainingRejected, RegistrationConflict
+
+    clock = FakeClock()
+    reg = Registry(clock)
+    inst = make_inst(clock, lease_seconds=5)
+    await reg.register(inst)
+    await reg.mark_draining(inst.id)
+    # 下线中：续约被明确拒绝，不会被下线复活矛盾。
+    with pytest.raises(HeartbeatDrainingRejected) as ei:
+        await reg.heartbeat(inst.id)
+    assert ei.value.code.value == "INSTANCE_DRAINING"
+    # 租约到期也不被过期摘除，仍可读。
+    clock.advance(50)
+    assert await reg.expire_due() == []
+    assert await reg.get(inst.id) is not None
+    # 下线中不能重新注册。
+    with pytest.raises(RegistrationConflict):
+        await reg.register(make_inst(clock, lease_seconds=5))

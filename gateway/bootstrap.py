@@ -11,11 +11,13 @@ from fastapi import FastAPI
 from .api import create_app
 from .circuit import CircuitBreaker
 from .clock import SystemClock
+from .drain import DrainCoordinator
 from .health import HealthMonitor, HealthProber
 from .models import Instance, RouteRule, new_instance
 from .pool import ConnectionPool
 from .registry import Registry
 from .router import Router
+from .sticky import SessionBinder
 from .transport import UpstreamTransport
 from .upstream import UpstreamCluster, MockUpstream
 from .engine import Gateway
@@ -50,10 +52,22 @@ def build_components(clock=None):
     pool = ConnectionPool(max_per_upstream=8, max_total=64)
     cluster = UpstreamCluster()
     transport = UpstreamTransport(cluster)
-    router = Router(registry, health, circuit)
+    binder = SessionBinder(clock, ttl_seconds=300.0, logger=logger)
+    router = Router(registry, health, circuit, binder=binder)
+    drain = DrainCoordinator(
+        registry, pool, health=health, circuit=circuit, binder=binder,
+        clock=clock, logger=logger,
+    )
+    # 同地址实例重新注册时清除旧的下线墓碑。
+    registry.on_registered = drain.reset_for_registration
+    # 连接池门禁：在池锁内、计数提交前拒绝正在退出的实例。
+    pool._admission_gate = drain.reject_if_exiting
+    # 路由层同步感知下线状态（标记集合），无需 await。
+    router._drain = drain
     gateway = Gateway(
         router, transport, health, circuit, pool,
-        max_retries=2, upstream_timeout=3.0, logger=logger,
+        max_retries=2, upstream_timeout=3.0, binder=binder,
+        drain_coordinator=drain, logger=logger,
     )
     return {
         "clock": clock,
@@ -65,6 +79,8 @@ def build_components(clock=None):
         "cluster": cluster,
         "transport": transport,
         "router": router,
+        "binder": binder,
+        "drain": drain,
         "gateway": gateway,
         "prober": _ClusterProber(cluster),
     }
@@ -113,12 +129,19 @@ def build_local_gateway() -> FastAPI:
             while not stop.is_set():
                 expired = await components["registry"].expire_due()
                 for iid in expired:
-                    components["health"].remove(iid)
-                    components["circuit"].remove(iid)
-                    components["pool"].remove(iid)
+                    # 统一走协调器：连接计数、健康/熔断状态、会话绑定一并清理，无残留。
+                    await components["drain"].cleanup_exited(iid)
                     logger.info("租约过期摘除 instance=%s", iid)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=1.0)
+
+        async def binding_prune_loop() -> None:
+            while not stop.is_set():
+                removed = components["binder"].prune()
+                if removed:
+                    logger.info("会话绑定过期清理 条数=%d", removed)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=2.0)
 
         async def probe_loop() -> None:
             while not stop.is_set():
@@ -133,7 +156,11 @@ def build_local_gateway() -> FastAPI:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=1.0)
 
-        tasks = [asyncio.create_task(lease_loop()), asyncio.create_task(probe_loop())]
+        tasks = [
+            asyncio.create_task(lease_loop()),
+            asyncio.create_task(probe_loop()),
+            asyncio.create_task(binding_prune_loop()),
+        ]
         try:
             yield
         finally:
@@ -153,6 +180,8 @@ def build_local_gateway() -> FastAPI:
         components["cluster"],
         clock=components["clock"],
         logger=components["logger"],
+        drain=components["drain"],
+        binder=components["binder"],
     )
     app.router.lifespan_context = lifespan
     return app

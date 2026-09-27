@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 from .models import InstanceId
 
@@ -43,9 +44,18 @@ class ConnectionPool:
     申请失败（超上限）在抛错前不做任何加计数，杜绝半更新状态。
     """
 
-    def __init__(self, max_per_upstream: int, max_total: int | None = None) -> None:
+    def __init__(
+        self,
+        max_per_upstream: int,
+        max_total: int | None = None,
+        *,
+        admission_gate: Callable[[InstanceId], None] | None = None,
+    ) -> None:
         self._max_per = max_per_upstream
         self._max_total = max_total
+        # 平滑退出门禁：在同一把池锁内、计数提交前判定，杜绝“选路后才宣告下线”
+        # 导致新请求仍落到退出实例的并发窗口；门禁拒绝时不产生任何计数变更。
+        self._admission_gate = admission_gate
         self._per: dict[InstanceId, int] = {}
         self._total = 0
         self._lock = asyncio.Lock()
@@ -55,6 +65,8 @@ class ConnectionPool:
         from .errors import ConcurrencyLimitReached
 
         async with self._lock:
+            if self._admission_gate is not None:
+                self._admission_gate(instance_id)
             current = self._per.get(instance_id, 0)
             if current >= self._max_per:
                 raise ConcurrencyLimitReached(

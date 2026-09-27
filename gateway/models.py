@@ -29,6 +29,9 @@ class Instance:
     registered_at: float
     last_heartbeat: float
     metadata: dict[str, str] = field(default_factory=dict)
+    # 平滑下线标记：置位后不再接新流量，且豁免租约过期、拒绝续约，
+    # 直到在途请求归零后由下线流程真正注销。
+    draining: bool = False
 
     @property
     def expires_at(self) -> float:
